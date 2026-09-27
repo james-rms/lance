@@ -135,6 +135,10 @@ name = "hnsw"
 harness = false
 
 [[bench]]
+name = "hnsw_remap"
+harness = false
+
+[[bench]]
 name = "sq"
 harness = false
 
