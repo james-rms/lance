@@ -1755,11 +1755,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
+        let batch = self
+            .read_sub_index_batch(
+                partition_id,
+                self.read_projection.as_ref(),
+                io_stats.clone(),
+            )
+            .await?;
+        let idx = S::load(batch)?;
+        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        Ok(PartitionEntry::new(idx, storage))
+    }
+
+    /// Read the serialized sub-index of a partition, with its metadata attached.
+    ///
+    /// `projection` narrows the read to the columns search needs; `None` reads
+    /// every column the writer emitted, which a caller rewriting the partition
+    /// has to carry through. Bypasses the partition cache.
+    pub(crate) async fn read_sub_index_batch(
+        &self,
+        partition_id: usize,
+        projection: Option<&ReaderProjection>,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
         // was read: the full file schema over a projected read would index past
         // the last column.
-        let schema = Arc::new(match &self.read_projection {
+        let schema = Arc::new(match projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
         });
@@ -1781,7 +1804,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                         None => Cow::Borrowed(&self.reader),
                     };
                     let params = ReadBatchParams::Range(row_range);
-                    let stream = match &self.read_projection {
+                    let stream = match projection {
                         Some(projection) => {
                             reader
                                 .read_stream_projected(
@@ -1804,13 +1827,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 }
             }
         };
-        let batch = batch.add_metadata(
+        Ok(batch.add_metadata(
             S::metadata_key().to_owned(),
             self.sub_index_metadata[partition_id].clone(),
-        )?;
-        let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
-        Ok(PartitionEntry::new(idx, storage))
+        )?)
     }
 
     async fn materialize_prewarm_partition(
@@ -2989,7 +3009,7 @@ mod tests {
     };
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
+    use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
@@ -3040,8 +3060,8 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
-    use lance_index::vector::hnsw::HNSW;
-    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
+    use lance_index::vector::hnsw::{HNSW, HnswMetadata};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
@@ -6828,6 +6848,198 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 0, "no non-empty partition was compared");
+    }
+
+    /// Each partition's graph as written, with the row ids of its storage.
+    async fn read_hnsw_graphs(dataset: &Dataset) -> Vec<(RecordBatch, Vec<u64>)> {
+        let index = open_ivf_hnsw_sq(dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+        let mut graphs = Vec::with_capacity(hnsw.ivf.num_partitions());
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let graph = hnsw
+                .read_sub_index_batch(partition_id, None, None)
+                .await
+                .unwrap();
+            let storage = hnsw
+                .load_partition_storage(partition_id, None)
+                .await
+                .unwrap();
+            graphs.push((graph, storage.row_ids().copied().collect()));
+        }
+        graphs
+    }
+
+    fn level0_edges(graph: &RecordBatch) -> HashSet<(u32, u32)> {
+        let metadata: HnswMetadata =
+            serde_json::from_str(&graph.schema_ref().metadata()[HNSW_METADATA_KEY]).unwrap();
+        let neighbors = graph[HNSW_NEIGHBORS_COL].as_list::<i32>();
+        (0..metadata.level_offsets[1])
+            .flat_map(|node| {
+                let neighbors = neighbors.value(node);
+                neighbors
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .map(|neighbor| (node as u32, *neighbor))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Compaction carries each HNSW graph over instead of rebuilding it: the
+    /// graph is unchanged when no row is deleted, and otherwise loses only the
+    /// deleted nodes and the edges to them, unless so many rows are deleted
+    /// that the graph is rebuilt.
+    #[rstest]
+    #[case::no_deletions(None, true)]
+    #[case::few_deletions(Some(20), true)]
+    #[case::many_deletions(Some(2), false)]
+    #[tokio::test]
+    async fn test_compaction_keeps_hnsw_graph(
+        #[case] delete_every: Option<u64>,
+        #[case] is_graph_kept: bool,
+    ) {
+        const NLIST: usize = 2;
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 20;
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = generate_batch::<Float32Type>(NUM_ROWS, None, 0.0..1.0, false);
+        let vectors = batch["vector"].as_fixed_size_list().clone();
+        let mut dataset = write_dataset_from_batches_with_max_rows(
+            test_dir.as_str(),
+            schema,
+            vec![batch],
+            NUM_ROWS / 4,
+        )
+        .await;
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(NLIST),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let search = async |dataset: &Dataset, query: &dyn Array| {
+            dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .with_row_id()
+                .nearest("vector", query, K)
+                .unwrap()
+                .minimum_nprobes(NLIST)
+                .try_into_batch()
+                .await
+                .unwrap()
+        };
+        let old_graphs = read_hnsw_graphs(&dataset).await;
+        let mut old_results = Vec::with_capacity(NUM_QUERIES);
+        for i in 0..NUM_QUERIES {
+            old_results.push(search(&dataset, &vectors.value(i)).await);
+        }
+        let old_dataset = dataset.clone();
+        let old_index_id = dataset.load_indices().await.unwrap()[0].uuid;
+
+        let is_deleted = |id: u64| delete_every.is_some_and(|every| id.is_multiple_of(every));
+        if let Some(every) = delete_every {
+            dataset.delete(&format!("id % {every} = 0")).await.unwrap();
+        }
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_ne!(dataset.load_indices().await.unwrap()[0].uuid, old_index_id);
+        let new_graphs = read_hnsw_graphs(&dataset).await;
+        assert_eq!(new_graphs.len(), old_graphs.len());
+
+        if delete_every.is_none() {
+            for ((old, old_rows), (new, new_rows)) in old_graphs.iter().zip(&new_graphs) {
+                assert_eq!(old_rows.len(), new_rows.len());
+                assert_eq!(old.columns(), new.columns());
+                assert_eq!(
+                    old.schema_ref().metadata()[HNSW_METADATA_KEY],
+                    new.schema_ref().metadata()[HNSW_METADATA_KEY]
+                );
+            }
+            // Same graph, same vectors: same neighbors at the same distances,
+            // reported under the rewritten row addresses.
+            for (i, old_result) in old_results.iter().enumerate() {
+                let new_result = search(&dataset, &vectors.value(i)).await;
+                assert_eq!(&old_result["id"], &new_result["id"], "query {i}");
+                assert_eq!(&old_result[DIST_COL], &new_result[DIST_COL], "query {i}");
+                assert_ne!(&old_result[ROW_ID], &new_result[ROW_ID], "query {i}");
+            }
+            return;
+        }
+
+        let id_projection = dataset.schema().project(&["id"]).unwrap();
+        let mut num_rebuilt = 0;
+        for ((old, old_rows), (new, new_rows)) in old_graphs.iter().zip(&new_graphs) {
+            let old_ids = old_dataset
+                .take_rows(old_rows, id_projection.clone())
+                .await
+                .unwrap();
+            let mut new_of_old = Vec::with_capacity(old_rows.len());
+            let mut num_kept = 0;
+            for id in old_ids["id"].as_primitive::<UInt64Type>().values() {
+                if is_deleted(*id) {
+                    new_of_old.push(None);
+                } else {
+                    new_of_old.push(Some(num_kept));
+                    num_kept += 1;
+                }
+            }
+            assert_eq!(num_kept as usize, new_rows.len());
+
+            let new_edges = level0_edges(new);
+            assert!(
+                new_edges
+                    .iter()
+                    .all(|(from, to)| (*from as usize) < new_rows.len()
+                        && (*to as usize) < new_rows.len())
+            );
+            let relabeled_old_edges = level0_edges(old)
+                .into_iter()
+                .filter_map(|(from, to)| {
+                    Some((new_of_old[from as usize]?, new_of_old[to as usize]?))
+                })
+                .collect::<HashSet<_>>();
+            if is_graph_kept {
+                assert_eq!(new_edges, relabeled_old_edges);
+            } else if !new_edges.is_subset(&relabeled_old_edges) {
+                num_rebuilt += 1;
+            }
+        }
+        // A rebuilt graph links nodes that were not linked before. A tiny
+        // partition can be fully linked either way, so require it of any one.
+        assert_eq!(num_rebuilt > 0, !is_graph_kept);
+
+        let mut hits = 0;
+        for i in 0..NUM_QUERIES {
+            let query = vectors.value(i);
+            let result = search(&dataset, &query).await;
+            let ids = result["id"].as_primitive::<UInt64Type>();
+            assert!(ids.values().iter().all(|id| !is_deleted(*id)), "query {i}");
+            // The row addresses search reports must point at the rows it matched.
+            let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+            let taken = dataset
+                .take_rows(row_ids, id_projection.clone())
+                .await
+                .unwrap();
+            assert_eq!(&taken["id"], &result["id"], "query {i}");
+
+            let gt = ground_truth(&dataset, "vector", &query, K, DistanceType::L2).await;
+            hits += row_ids.iter().filter(|id| gt.contains(id)).count();
+        }
+        let recall = hits as f32 / (NUM_QUERIES * K) as f32;
+        assert_ge!(recall, 0.8, "recall after compaction with deletions");
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
