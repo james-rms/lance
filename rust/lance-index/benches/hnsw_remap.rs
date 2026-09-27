@@ -5,6 +5,10 @@
 //! over ([`remap_graph_batch`]) versus rebuilding it ([`HNSW::remap`], the
 //! previous behavior).
 //!
+//! Production remap reuses the graph only when no row is deleted. This bench
+//! still times the edge-dropping relabel at higher deletion fractions, which
+//! is the recall cost of keeping a thinned graph.
+//!
 //! For each partition size and deleted fraction this reports wall time, CPU
 //! time and peak heap growth of both paths, recall@K of both graphs against
 //! exact search on the surviving vectors, the level-0 degree left after

@@ -6889,13 +6889,11 @@ mod tests {
             .collect()
     }
 
-    /// Compaction carries each HNSW graph over instead of rebuilding it: the
-    /// graph is unchanged when no row is deleted, and otherwise loses only the
-    /// deleted nodes and the edges to them, unless so many rows are deleted
-    /// that the graph is rebuilt.
+    /// Compaction copies each HNSW graph when no row is deleted, and rebuilds
+    /// it when any row is deleted.
     #[rstest]
     #[case::no_deletions(None, true)]
-    #[case::few_deletions(Some(20), true)]
+    #[case::few_deletions(Some(20), false)]
     #[case::many_deletions(Some(2), false)]
     #[tokio::test]
     async fn test_compaction_keeps_hnsw_graph(

@@ -181,28 +181,17 @@ fn apply_centroid_splits(
     )?)
 }
 
-/// Largest fraction of a partition's vectors a remap may delete while the
-/// partition keeps its HNSW graph; above it the graph is rebuilt.
-///
-/// Keeping the graph drops the deleted nodes' edges without re-linking their
-/// neighbors, so recall falls with the deleted fraction. On synthetic
-/// benchmarks (`lance-index/benches/hnsw_remap.rs`) the recall@10 lost against
-/// a rebuild was within about 2 points on low-rank data and up to about 4
-/// points on uniform random data at 10% deleted, and up to 9 points at 25%.
-/// Deletions of successive remaps compound, since each one drops edges from
-/// the graph the previous one kept.
-const MAX_DELETED_FRACTION_TO_KEEP_HNSW_GRAPH: f64 = 0.1;
-
-/// Remap one partition of an IVF_HNSW index, keeping its graph.
+/// Remap one partition of an IVF_HNSW index.
 ///
 /// Every quantizer storage `remap` keeps the surviving vectors in their
-/// original order, so the graph is carried over by [`remap_graph_batch`]
-/// instead of being rebuilt: unchanged if no row was deleted, otherwise with
-/// the deleted nodes and the edges to them removed. The graph is read with all
-/// columns because search loads skip the distances the index file must keep.
+/// original order, so when no row was deleted the graph is carried over by
+/// [`remap_graph_batch`] unchanged. The graph is read with all columns because
+/// search loads skip the distances the index file must keep.
 ///
-/// The graph is rebuilt instead if the remap deletes more than
-/// [`MAX_DELETED_FRACTION_TO_KEEP_HNSW_GRAPH`] of the partition.
+/// Any deleted row rebuilds the graph. Dropping a node removes its edges and
+/// nothing re-links the survivors, so recall falls as deletions accumulate
+/// across compactions. The cost of that thinning is measured by
+/// `lance-index/benches/hnsw_remap.rs`; this path does not take it.
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
@@ -223,7 +212,7 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
         }
     }
     let num_deleted = old_storage.len() - num_kept as usize;
-    if num_deleted as f64 > MAX_DELETED_FRACTION_TO_KEEP_HNSW_GRAPH * old_storage.len() as f64 {
+    if num_deleted > 0 {
         log::debug!(
             "Rebuilding the HNSW graph of partition {partition_id} during remap: {num_deleted} \
              of {} vectors were deleted",
