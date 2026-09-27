@@ -6889,8 +6889,9 @@ mod tests {
             .collect()
     }
 
-    /// Compaction copies each HNSW graph when no row is deleted, and rebuilds
-    /// it when any row is deleted.
+    /// Compaction copies each HNSW graph when no row is deleted. When rows are
+    /// deleted the surviving edges are kept and the nodes that lost a neighbor
+    /// are reconnected, so the level-0 edges are not just the old edges relabeled.
     #[rstest]
     #[case::no_deletions(None, true)]
     #[case::few_deletions(Some(20), false)]
@@ -7015,8 +7016,8 @@ mod tests {
                 num_rebuilt += 1;
             }
         }
-        // A rebuilt graph links nodes that were not linked before. A tiny
-        // partition can be fully linked either way, so require it of any one.
+        // Repair adds links the old graph did not have. A tiny partition can
+        // be fully linked either way, so require that of any one partition.
         assert_eq!(num_rebuilt > 0, !is_graph_kept);
 
         let mut hits = 0;

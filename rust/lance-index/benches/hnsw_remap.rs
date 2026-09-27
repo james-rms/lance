@@ -5,9 +5,11 @@
 //! over ([`remap_graph_batch`]) versus rebuilding it ([`HNSW::remap`], the
 //! previous behavior).
 //!
-//! Production remap reuses the graph only when no row is deleted. This bench
-//! still times the edge-dropping relabel at higher deletion fractions, which
-//! is the recall cost of keeping a thinned graph.
+//! Production remap copies the graph when no row is deleted. When rows are
+//! deleted, `repair` keeps the surviving edges and reconnects each node that
+//! lost a neighbor with a construction-ef beam search and the builder's
+//! neighbor heuristic, instead of rebuilding. `reuse` is the unrepaired edge
+//! drop, kept so its recall cost stays visible.
 //!
 //! For each partition size and deleted fraction this reports wall time, CPU
 //! time and peak heap growth of both paths, recall@K of both graphs against
@@ -50,7 +52,7 @@ use lance_file::writer::FileWriterOptions;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams, HnswQueryParams};
-use lance_index::vector::hnsw::remap::remap_graph_batch;
+use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::hnsw::{HNSW, HnswMetadata};
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::sq::{
@@ -402,6 +404,27 @@ fn main() {
                 })
                 .collect::<Vec<_>>();
             print_measured(&case, "reuse", &reuse);
+            let repair = (0..repeats)
+                .map(|_| {
+                    measure(|| {
+                        let new_ids = storage
+                            .row_ids()
+                            .scan(0u32, |next, row_id| {
+                                Some(match mapping.get(*row_id) {
+                                    Some(None) => None,
+                                    _ => {
+                                        *next += 1;
+                                        Some(*next - 1)
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        HNSW::load(remap_graph_repair(&graph, &new_ids, &new_storage).unwrap())
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_measured(&case, "repair", &repair);
             let rebuild = (0..repeats)
                 .map(|_| {
                     measure(|| {
@@ -415,9 +438,12 @@ fn main() {
             print_measured(&case, "rebuild", &rebuild);
 
             let reused = &reuse[0].value;
+            let repaired = &repair[0].value;
             let rebuilt = &rebuild[0].value;
             let reused_batch = reused.to_batch().unwrap();
+            let repaired_batch = repaired.to_batch().unwrap();
             let stats = graph_stats(&reused_batch);
+            let repair_stats = graph_stats(&repaired_batch);
             let rebuilt_stats = graph_stats(&rebuilt.to_batch().unwrap());
             assert!(
                 stats
@@ -435,6 +461,16 @@ fn main() {
                 stats.level0_mean_degree,
                 stats.level0_isolated,
                 stats.max_neighbor_id
+            );
+            println!(
+                "graph {case} path=repair rows={} level_members={} edges={} \
+                 level0_mean_degree={:.2} level0_isolated={} max_neighbor_id={:?}",
+                repair_stats.rows,
+                repair_stats.level_members,
+                repair_stats.edges,
+                repair_stats.level0_mean_degree,
+                repair_stats.level0_isolated,
+                repair_stats.max_neighbor_id
             );
             println!(
                 "graph {case} path=rebuild rows={} level_members={} edges={} \
@@ -457,6 +493,7 @@ fn main() {
             let new_row_ids = new_storage.row_ids().copied().collect::<HashSet<_>>();
             for (i, &ef) in EFS.iter().enumerate() {
                 let after_reuse = search(reused, &new_storage, &queries, ef);
+                let after_repair = search(repaired, &new_storage, &queries, ef);
                 // Each rebuild is a different graph (insertion runs in parallel),
                 // so their spread is the noise to judge the reuse delta against.
                 let rebuild_recalls = rebuild
@@ -492,10 +529,11 @@ fn main() {
                     String::new()
                 };
                 println!(
-                    "recall {case} ef={ef} pre_remap={:.4} reuse={:.4} rebuild_median={:.4} \
-                     rebuild_runs={:?}{same_as_before}",
+                    "recall {case} ef={ef} pre_remap={:.4} reuse={:.4} repair={:.4} \
+                     rebuild_median={:.4} rebuild_runs={:?}{same_as_before}",
                     recall(&before[i], &truth_before, |id| id),
                     recall(&after_reuse, &truth_after, to_position),
+                    recall(&after_repair, &truth_after, to_position),
                     rebuild_median,
                     rebuild_recalls
                         .iter()

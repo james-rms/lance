@@ -40,7 +40,7 @@ use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::hnsw::remap::remap_graph_batch;
+use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -188,10 +188,11 @@ fn apply_centroid_splits(
 /// [`remap_graph_batch`] unchanged. The graph is read with all columns because
 /// search loads skip the distances the index file must keep.
 ///
-/// Any deleted row rebuilds the graph. Dropping a node removes its edges and
-/// nothing re-links the survivors, so recall falls as deletions accumulate
-/// across compactions. The cost of that thinning is measured by
-/// `lance-index/benches/hnsw_remap.rs`; this path does not take it.
+/// A deleted row does not rebuild the graph. Edges between survivors are kept,
+/// and each node that lost a neighbor is reconnected by
+/// [`remap_graph_repair`]: a construction-time beam search over the surviving
+/// graph, then the same neighbor heuristic the builder uses. The graph is
+/// rebuilt only when that repair cannot be applied.
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
@@ -212,14 +213,13 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
         }
     }
     let num_deleted = old_storage.len() - num_kept as usize;
-    if num_deleted > 0 {
-        log::debug!(
-            "Rebuilding the HNSW graph of partition {partition_id} during remap: {num_deleted} \
-             of {} vectors were deleted",
-            old_storage.len()
-        );
-    } else if num_kept as usize == storage.len() {
-        match remap_graph_batch(&graph, &new_ids) {
+    if num_kept as usize == storage.len() {
+        let repaired = if num_deleted == 0 {
+            remap_graph_batch(&graph, &new_ids)
+        } else {
+            remap_graph_repair(&graph, &new_ids, &storage)
+        };
+        match repaired {
             Ok(graph) => return Ok((storage, S::load(graph)?)),
             // An index written before graphs were bounded to their storage can
             // hold fewer nodes than vectors; rebuilding gives it full coverage.
