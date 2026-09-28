@@ -598,7 +598,7 @@ fn level_from_rows<S: VectorStore>(
 ///
 /// Reciprocal trimming can drop the only inbound edge of a node. Search only
 /// walks level 0 from the entry point, so those nodes are then linked with
-/// [`connect_stranded_level0`], the same pass the builder runs after a
+/// `connect_stranded_level0`, the same pass the builder runs after a
 /// parallel insert.
 ///
 /// `storage` is the remapped partition, in the new local-id order `new_ids`
@@ -1086,7 +1086,7 @@ mod tests {
         let meta = metadata(batch);
         let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
         let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
-        let level0 = meta.level_offsets[1] as usize;
+        let level0 = meta.level_offsets[1];
         let n = ids.values()[..level0].iter().copied().max().unwrap_or(0) as usize + 1;
         let mut adj = vec![Vec::new(); n];
         let mut present = vec![false; n];
