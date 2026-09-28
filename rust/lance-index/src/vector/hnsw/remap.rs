@@ -22,7 +22,7 @@ use itertools::Itertools;
 use lance_core::{Error, Result};
 use rayon::prelude::*;
 
-use super::builder::{HNSW_METADATA_KEY, HnswQueryParams};
+use super::builder::{HNSW_METADATA_KEY, HnswQueryParams, Level0Links, connect_stranded_level0};
 use super::{HNSW, HnswMetadata, VECTOR_ID_COL, select_neighbors_heuristic_owned};
 use crate::vector::DIST_COL;
 use crate::vector::graph::{
@@ -596,6 +596,11 @@ fn level_from_rows<S: VectorStore>(
 /// used to step through a deleted node are replaced by links a rebuild would
 /// have drawn. Nodes that lost nothing keep their edges.
 ///
+/// Reciprocal trimming can drop the only inbound edge of a node. Search only
+/// walks level 0 from the entry point, so those nodes are then linked with
+/// [`connect_stranded_level0`], the same pass the builder runs after a
+/// parallel insert.
+///
 /// `storage` is the remapped partition, in the new local-id order `new_ids`
 /// assigns. With no deletions the input batch is returned unchanged.
 pub fn remap_graph_repair<S: VectorStore + Sync>(
@@ -635,6 +640,16 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
         .ok_or_else(|| Error::internal("HNSW repair kept nodes on no level".to_string()))?;
     let ef = parsed.metadata.params.ef_construction.min(kept.max(1));
     reselect_damaged(&mut levels, entry_point, ef, storage);
+    {
+        let mut level0 = Level0Adj::new(&mut levels[0]);
+        connect_stranded_level0(
+            &mut level0,
+            entry_point,
+            parsed.metadata.params.ef_construction,
+            storage,
+        );
+    }
+    refresh_search_ids(&mut levels[0]);
 
     let mut id_builder = UInt32Builder::with_capacity(parsed.num_rows);
     let mut neighbors_builder = ListBuilder::with_capacity(
@@ -682,6 +697,49 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
             Arc::new(distances_builder.finish()),
         ],
     )?)
+}
+
+/// Level 0 of a repaired graph, as the builder's stranded-node linker sees it.
+struct Level0Adj<'a> {
+    edges: &'a mut [Vec<(u32, f32)>],
+    ids: Vec<Arc<Vec<u32>>>,
+}
+
+impl<'a> Level0Adj<'a> {
+    fn new(level: &'a mut LevelAdj) -> Self {
+        let ids = level
+            .neighbors
+            .iter()
+            .map(|edges| Arc::new(edges.iter().map(|(id, _)| *id).collect()))
+            .collect();
+        Self {
+            edges: level.neighbors.as_mut_slice(),
+            ids,
+        }
+    }
+}
+
+impl Level0Links for Level0Adj<'_> {
+    fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>> {
+        self.ids[id as usize].clone()
+    }
+
+    fn ranked(&self, id: u32) -> Vec<OrderedNode> {
+        self.edges[id as usize]
+            .iter()
+            .map(|(id, dist)| OrderedNode::new(*id, (*dist).into()))
+            .collect()
+    }
+
+    fn link(&mut self, anchor: OrderedNode, node: u32) {
+        let edges = &mut self.edges[anchor.id as usize];
+        edges.push((node, anchor.dist.0));
+        self.ids[anchor.id as usize] = Arc::new(edges.iter().map(|(id, _)| *id).collect());
+    }
 }
 
 #[cfg(test)]
@@ -972,5 +1030,97 @@ mod tests {
         let new_ids = (0..64).map(Some).collect::<Vec<_>>();
         let err = remap_graph_batch(&projected, &new_ids).unwrap_err();
         assert!(err.to_string().contains(DIST_COL), "{err}");
+    }
+
+    /// Deleting from a graph of identical vectors drops the only inbound edge of
+    /// many nodes. The repair links each of them back, and a wide search can
+    /// return them.
+    #[test]
+    fn test_repair_keeps_survivors_reachable() {
+        const N: usize = 500;
+        let values = arrow_array::Float32Array::from(vec![0.0f32; N * DIM]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(4).ef_construction(4),
+        )
+        .unwrap();
+        let batch = hnsw.to_batch().unwrap();
+
+        let mut new_ids = Vec::with_capacity(N);
+        let mut kept_idx = Vec::new();
+        for old_id in 0..N {
+            if old_id % 100 == 0 {
+                new_ids.push(None);
+            } else {
+                new_ids.push(Some(kept_idx.len() as u32));
+                kept_idx.push(old_id as u32);
+            }
+        }
+        let kept = take(&vectors, &UInt32Array::from(kept_idx), None).unwrap();
+        let kept = kept.as_fixed_size_list().clone();
+        let kept_store = FlatFloatStorage::new(kept, DistanceType::L2);
+
+        let repaired = remap_graph_repair(&batch, &new_ids, &kept_store).unwrap();
+        let (reached, total) = reachable_from_entry(&repaired);
+        assert_eq!(reached, total, "repair left nodes stranded");
+        assert_eq!(total, N - N / 100);
+
+        let params = HnswQueryParams {
+            ef: 300,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let hits = HNSW::load(repaired)
+            .unwrap()
+            .search_basic(vectors.value(0), 300, &params, None, &kept_store)
+            .unwrap()
+            .len();
+        assert_eq!(hits, 300);
+    }
+
+    fn reachable_from_entry(batch: &RecordBatch) -> (usize, usize) {
+        let meta = metadata(batch);
+        let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
+        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
+        let level0 = meta.level_offsets[1] as usize;
+        let n = ids.values()[..level0].iter().copied().max().unwrap_or(0) as usize + 1;
+        let mut adj = vec![Vec::new(); n];
+        let mut present = vec![false; n];
+        for row in 0..level0 {
+            let id = ids.value(row) as usize;
+            present[id] = true;
+            adj[id] = neighbors
+                .value(row)
+                .as_primitive::<UInt32Type>()
+                .values()
+                .to_vec();
+        }
+        let mut reachable = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        let entry = meta.entry_point as usize;
+        if entry < n {
+            reachable[entry] = true;
+            queue.push_back(entry);
+        }
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in &adj[current] {
+                let neighbor = neighbor as usize;
+                if neighbor < n && !reachable[neighbor] {
+                    reachable[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let total = present.iter().filter(|on| **on).count();
+        let reached = present
+            .iter()
+            .zip(&reachable)
+            .filter(|(on, reached)| **on && **reached)
+            .count();
+        (reached, total)
     }
 }
